@@ -7,6 +7,8 @@ import sys
 import typing
 import warnings
 from abc import ABC
+from io import BufferedReader
+from itertools import count
 from base64 import (
     b64decode,
     b64encode,
@@ -32,6 +34,7 @@ from typing import (
     Type,
     Union,
     get_type_hints,
+    BinaryIO,
 )
 
 from dateutil.parser import isoparse
@@ -485,6 +488,41 @@ def decode_varint(buffer: bytes, pos: int) -> Tuple[int, int]:
         shift += 7
         if shift >= 64:
             raise ValueError("Too many bytes when decoding varint.")
+
+
+def load_varint(stream: BinaryIO) -> int:
+    """
+    Read a single varint value from a stream.
+    Returns the value or raises an error if EOF is reached (EOFError if started at EOF,
+    ValueError if EOF part way through a varint).
+    """
+    value = 0
+
+    for shift in count():
+        # Read the next byte and check that it is valid
+        byte = stream.read(1)
+        if byte == b"":
+            if shift == 0:
+                # No bytes read yet, so attempting to read from EOF
+                raise EOFError("Stream is at EOF, so cannot load varint")
+            else:
+                # Was part way through a varint if this was reached
+                raise ValueError("Stream ended part way through a varint")
+
+        # Add current byte's stored value to the overall value
+        byte_int = int.from_bytes(byte, byteorder="little")
+        value += (byte_int & 0b01111111) << (7 * shift)
+
+        # Stop reading if this is the last byte
+        if byte_int >> 7 != 1:
+            break
+
+    return value
+
+
+def dump_varint(value: int, stream: BinaryIO) -> None:
+    """Write a single varint value to a stream."""
+    stream.write(encode_varint(value))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1027,6 +1065,80 @@ class Message(ABC):
 
         return self
 
+    def from_stream(self: T, stream: BinaryIO, size: int = None) -> T:
+        """
+        Parse the binary encoded Protobuf from the provided stream into this message
+        instance. This returns the instance itself and is therefore assignable and
+        chainable. Returns ``None`` if the stream is at EOF and no size was
+        specified.
+
+        Parameters
+        -----------
+        stream: :class:`BufferedReader`
+            The stream to read and parse the protobuf from.
+        size: :class:`int`
+            The size of the data to be read as a message from the stream.
+
+        Returns
+        --------
+        :class:`Message`
+            The initialized message.
+        """
+        encoded = stream.read(size)
+        if encoded == b"":
+            if size is None:
+                raise EOFError("Stream is at EOF, so cannot load message")
+            else:
+                raise ValueError(
+                    f"Expected message of size {size} but stream was at EOF."
+                )
+        else:
+            return self.parse(encoded)
+
+    def from_stream_delimited(self: T, stream: BinaryIO) -> Optional[T]:
+        """
+        Like ``from_stream``, but reads the size of the message from the stream
+        first, and then the message itself based on that. Message size is encoded as a
+        varint. Returns ``None`` if the stream is at EOF.
+
+        Parameters
+        -----------
+        stream: :class:`BufferedReader`
+            The stream to read and parse the protobuf from.
+
+        Returns
+        --------
+        :class:`Message`
+            The initialized message.
+        """
+        return self.from_stream(stream, load_varint(stream))
+
+    def to_stream(self, stream: BinaryIO):
+        """
+        Writes the binary encoded Protobuf message directly to the stream. This writes
+        only the message, with no delimiting or anything else.
+
+        Parameters
+        -----------
+        stream: :class:`BufferedReader`
+            The stream to write the protobuf to.
+        """
+        stream.write(bytes(self))
+
+    def to_stream_delimited(self, stream: BinaryIO):
+        """
+        Writes the binary encoded Protobuf message to the stream, prefixed with a
+        varint delimiting the message and providing its size.
+
+        Parameters
+        -----------
+        stream: :class:`BufferedReader`
+            The stream to write the protobuf to.
+        """
+        encoded = bytes(self)
+        dump_varint(len(encoded), stream)
+        stream.write(encoded)
+
     # For compatibility with other libraries.
     @classmethod
     def FromString(cls: Type[T], data: bytes) -> T:
@@ -1486,7 +1598,6 @@ class Message(ABC):
         field_name_to_meta = cls._betterproto_meta.meta_by_field_name  # type: ignore
 
         for group, field_set in group_to_one_ofs.items():
-
             if len(field_set) == 1:
                 (field,) = field_set
                 field_name = field.name
